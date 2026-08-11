@@ -51,7 +51,9 @@ A combined toolkit for Claude Code that provides:
 
 ### Setting up Claude Code hooks
 
-Add the following to your Claude Code settings (`~/.claude/settings.json`):
+Price Check uses three integration points in `~/.claude/settings.json`: a `SessionStart` hook (fetches latest pricing), a `Stop` hook (updates the status line after each turn), and a `statusLine` entry.
+
+**If you don't have existing hooks**, you can add the full block:
 
 ```json
 {
@@ -84,6 +86,38 @@ Add the following to your Claude Code settings (`~/.claude/settings.json`):
   "statusLine": {
     "type": "command",
     "command": "python3 /path/to/agent-handoff/price_check/main.py --status-line"
+  }
+}
+```
+
+**If you already have hooks defined**, merge these entries into your existing config:
+
+- Append the `SessionStart` and `Stop` objects to the corresponding arrays. Each hook event (`SessionStart`, `Stop`, etc.) takes an array of matcher/hooks pairs — add a new entry alongside your existing ones rather than replacing them.
+- If you already have a `statusLine`, you'll need to wrap both commands in a shell script or choose one, since `statusLine` only accepts a single command.
+
+For example, if you already have a `Stop` hook:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "your-existing-stop-hook" }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/agent-handoff/price_check/main.py --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
 ```
