@@ -25,6 +25,7 @@ from pathlib import Path
 MAX_JSONL_SIZE = 100 * 1024 * 1024  # 100 MB
 _SYSTEM_PREFIXES = ("<system-reminder", "<task-notification", "<command-message")
 _TAG_ABBREV = {"standard": "std", "medium": "med", "high": "hi", "fast": "fast"}
+PERIOD_CACHE_TTL = 60  # seconds - how long to cache period totals (today/week/month)
 
 
 def _abbrev_tag(tag: str) -> str:
@@ -1277,6 +1278,33 @@ def _safe_state_path(session_id: str) -> Path | None:
     return path
 
 
+def _get_period_cache_path() -> Path:
+    return Path(tempfile.gettempdir()) / "claude-cost-periods.json"
+
+
+def _read_period_cache() -> dict | None:
+    """Read cached period totals if fresh (< PERIOD_CACHE_TTL seconds old)."""
+    cache_file = _get_period_cache_path()
+    try:
+        stat = cache_file.stat()
+        age = datetime.now().timestamp() - stat.st_mtime
+        if age > PERIOD_CACHE_TTL:
+            return None
+        data = json.loads(cache_file.read_text())
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def _write_period_cache(data: dict):
+    """Write period totals to cache file."""
+    cache_file = _get_period_cache_path()
+    try:
+        _write_state(cache_file, json.dumps(data))
+    except OSError:
+        pass  # Silent fail - cache is optional
+
+
 def _write_state(path: Path, data: str):
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -1356,16 +1384,37 @@ def _compute_state(session_id: str, cwd: str = "") -> dict | None:
     turn_cost = sum(m["cost"] or 0 for m in turn_models.values())
     turn_tok = sum(m["tokens"] or 0 for m in turn_models.values())
 
-    daily, daily_turns = scan_jsonl_files(31)
-    today_set, week_set, month_set = _period_date_sets()
+    # Try to use cached period totals to avoid expensive scan on every prompt
+    cached = _read_period_cache()
+    if cached:
+        today_by_model = cached.get("today_by_model", {})
+        week_by_model = cached.get("week_by_model", {})
+        month_by_model = cached.get("month_by_model", {})
+        today_turns = cached.get("today_turns", 0)
+        week_turns = cached.get("week_turns", 0)
+        month_turns = cached.get("month_turns", 0)
+    else:
+        # Cache miss or stale - do the expensive scan
+        daily, daily_turns = scan_jsonl_files(31)
+        today_set, week_set, month_set = _period_date_sets()
 
-    today_by_model = _build_display(_aggregate_for_dates(daily, today_set), all_tags=True)
-    week_by_model = _build_display(_aggregate_for_dates(daily, week_set), all_tags=True)
-    month_by_model = _build_display(_aggregate_for_dates(daily, month_set), all_tags=True)
+        today_by_model = _build_display(_aggregate_for_dates(daily, today_set), all_tags=True)
+        week_by_model = _build_display(_aggregate_for_dates(daily, week_set), all_tags=True)
+        month_by_model = _build_display(_aggregate_for_dates(daily, month_set), all_tags=True)
 
-    today_turns = sum(daily_turns.get(d, 0) for d in today_set)
-    week_turns = sum(daily_turns.get(d, 0) for d in week_set)
-    month_turns = sum(daily_turns.get(d, 0) for d in month_set)
+        today_turns = sum(daily_turns.get(d, 0) for d in today_set)
+        week_turns = sum(daily_turns.get(d, 0) for d in week_set)
+        month_turns = sum(daily_turns.get(d, 0) for d in month_set)
+
+        # Update the cache
+        _write_period_cache({
+            "today_by_model": today_by_model,
+            "week_by_model": week_by_model,
+            "month_by_model": month_by_model,
+            "today_turns": today_turns,
+            "week_turns": week_turns,
+            "month_turns": month_turns,
+        })
 
     return {
         "cost": session_cost, "tokens": session_tok,
