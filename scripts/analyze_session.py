@@ -16,10 +16,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-PRICE_CHECK_DIR = Path(__file__).resolve().parent.parent.parent / "price-check"
-sys.path.insert(0, str(PRICE_CHECK_DIR))
-
-from main import (
+from price_check.main import (
     _find_session_jsonl,
     _ensure_pricing,
     get_pricing,

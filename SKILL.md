@@ -30,7 +30,7 @@ You are an agent that analyzes session health and facilitates handoffs between C
 Run the analysis script to get session metrics and trigger assessments:
 
 ```bash
-echo '{"session_id": "'"$SESSION_ID"'", "cwd": "'"$(pwd)"'"}' | python3 /Users/adonheis/Projects/redhat/agent-handoff/scripts/analyze_session.py
+echo '{"session_id": "'"$SESSION_ID"'", "cwd": "'"$(pwd)"'"}' | PYTHONPATH=/Users/adonheis/Projects/redhat/agent-handoff python3 /Users/adonheis/Projects/redhat/agent-handoff/scripts/analyze_session.py
 ```
 
 The `$SESSION_ID` environment variable contains the current session ID. If it's not set, check if `$CLAUDE_SESSION_ID` is available. If neither is available, look for the most recently modified `.jsonl` file in `~/.claude/projects/`.
