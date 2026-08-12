@@ -102,6 +102,12 @@ Session: {session_id} | Turns: {N} | Cost: ${X} | Tokens: {Y}
 - {ordered list of remaining tasks, most important first}
 - {current blockers or open questions}
 
+## What's Going Wrong
+- {specific problems encountered — errors, unexpected behavior, failed approaches}
+- {patterns observed — e.g., "tests pass locally but fail in CI", "race condition under load"}
+- {hypotheses explored and their outcomes — what was tried, what was ruled out, what's still uncertain}
+- {any workarounds currently in place and why they're temporary}
+
 ## Key Context for Next Agent
 - **Files modified**: {list from git}
 - **Files to review first**: {the 2-3 most critical files the next agent should read}

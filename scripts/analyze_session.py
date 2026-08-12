@@ -51,7 +51,7 @@ def _is_system_prompt(obj: dict) -> bool:
 
 
 def scan_per_turn(jsonl_path: Path) -> list[dict]:
-    """Parse session JSONL into per-turn metrics.
+    """Parse session JSONL into per-turn metrics, including subagent usage.
 
     Returns a list of dicts, one per user turn (promptId), each containing:
       - turn_number, prompt_id
@@ -62,43 +62,28 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
     turns: list[dict] = []
     seen_requests: set[str] = set()
     system_pids: set[str] = set()
+    pid_to_turn: dict[str, int] = {}
     current_pid = None
-    current_bucket = None
-    current_models: set[str] = set()
+    current_model_buckets: dict[str, dict] | None = None
     current_tools: list[dict] = []
     current_errors = 0
     current_calls = 0
 
     def _flush():
-        nonlocal current_bucket, current_models, current_tools, current_errors, current_calls
-        if current_bucket is None or current_pid is None:
+        nonlocal current_model_buckets, current_tools, current_errors, current_calls
+        if current_model_buckets is None or current_pid is None:
             return
-        model_list = sorted(current_models)
-        cost = None
-        if model_list:
-            cost = 0.0
-            for m in model_list:
-                mbucket = {k: current_bucket[k] for k in ("input", "output", "cache_read", "cache_write")}
-                c = cost_for_model(mbucket, m)
-                if c is not None:
-                    cost += c
+        idx = len(turns)
+        pid_to_turn[current_pid] = idx
         turns.append({
-            "turn_number": len(turns) + 1,
+            "turn_number": idx + 1,
             "prompt_id": current_pid,
-            "input": current_bucket["input"],
-            "output": current_bucket["output"],
-            "cache_read": current_bucket["cache_read"],
-            "cache_write": current_bucket["cache_write"],
-            "total_tokens": total_tokens(current_bucket),
-            "cache_hit_pct": cache_pct(current_bucket),
-            "cost": cost,
-            "models": model_list,
+            "_model_buckets": current_model_buckets,
             "tool_calls": current_tools,
             "error_count": current_errors,
             "api_calls": current_calls,
         })
-        current_bucket = None
-        current_models = set()
+        current_model_buckets = None
         current_tools = []
         current_errors = 0
         current_calls = 0
@@ -124,7 +109,7 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
                 if pid != current_pid:
                     _flush()
                     current_pid = pid
-                    current_bucket = _empty_bucket()
+                    current_model_buckets = defaultdict(_empty_bucket)
 
             if pid and pid in system_pids:
                 continue
@@ -162,7 +147,7 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
                     current_tools[-1]["error"] = True
                     current_errors += 1
 
-            # Usage accumulation
+            # Usage accumulation — per-model buckets
             req_id = obj.get("requestId")
             if not req_id or req_id in seen_requests:
                 continue
@@ -173,16 +158,102 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
             model = msg.get("model", "unknown")
             if model.startswith("<"):
                 continue
-            if current_bucket is None:
-                current_bucket = _empty_bucket()
-            current_bucket["input"] += usage.get("input_tokens", 0)
-            current_bucket["output"] += usage.get("output_tokens", 0)
-            current_bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
-            current_bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
-            current_models.add(model)
+            if current_model_buckets is None:
+                current_model_buckets = defaultdict(_empty_bucket)
+            bucket = current_model_buckets[model]
+            bucket["input"] += usage.get("input_tokens", 0)
+            bucket["output"] += usage.get("output_tokens", 0)
+            bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+            bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+            bucket["calls"] += 1
             current_calls += 1
 
     _flush()
+
+    # ── subagent files ──
+    subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
+    if subagents_dir.is_dir():
+        for sf in subagents_dir.rglob("agent-*.jsonl"):
+            try:
+                sfh = sf.open()
+            except OSError:
+                continue
+
+            file_pids: set[str] = set()
+            file_model_buckets: dict[str, dict] = defaultdict(_empty_bucket)
+            file_calls = 0
+
+            with sfh:
+                for line in sfh:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    pid = obj.get("promptId")
+                    if pid:
+                        file_pids.add(pid)
+
+                    req_id = obj.get("requestId")
+                    if not req_id or req_id in seen_requests:
+                        continue
+                    msg = obj.get("message") or {}
+                    usage = msg.get("usage")
+                    if not usage or "output_tokens" not in usage:
+                        continue
+                    seen_requests.add(req_id)
+                    model = msg.get("model", "unknown")
+                    if model.startswith("<"):
+                        continue
+                    bucket = file_model_buckets[model]
+                    bucket["input"] += usage.get("input_tokens", 0)
+                    bucket["output"] += usage.get("output_tokens", 0)
+                    bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+                    bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+                    bucket["calls"] += 1
+                    file_calls += 1
+
+            if not file_model_buckets:
+                continue
+
+            # Assign subagent usage to the parent turn by promptId match
+            target_idx = None
+            for pid in file_pids:
+                if pid in pid_to_turn:
+                    target_idx = pid_to_turn[pid]
+                    break
+            if target_idx is None and turns:
+                target_idx = len(turns) - 1
+
+            if target_idx is not None:
+                turn_mb = turns[target_idx]["_model_buckets"]
+                for model, sub_bucket in file_model_buckets.items():
+                    for k in ("input", "output", "cache_read", "cache_write", "calls"):
+                        turn_mb[model][k] += sub_bucket[k]
+                turns[target_idx]["api_calls"] += file_calls
+
+    # ── finalize: compute derived fields from per-model buckets ──
+    for t in turns:
+        mb = t.pop("_model_buckets")
+        combined = _empty_bucket()
+        cost = 0.0
+        for model, bucket in mb.items():
+            for k in ("input", "output", "cache_read", "cache_write"):
+                combined[k] += bucket[k]
+            c = cost_for_model(bucket, model)
+            if c is not None:
+                cost += c
+        t.update({
+            "input": combined["input"],
+            "output": combined["output"],
+            "cache_read": combined["cache_read"],
+            "cache_write": combined["cache_write"],
+            "total_tokens": total_tokens(combined),
+            "cache_hit_pct": cache_pct(combined),
+            "cost": cost,
+            "models": sorted(mb.keys()),
+        })
+
     return turns
 
 
