@@ -1,14 +1,14 @@
 # Handoff Triggers
 
-## Token Bloat
+## Token Volume (informational)
 
-Session total tokens have grown large enough to degrade performance.
+Total tokens consumed in the session. Reported for context but does NOT
+trigger a handoff recommendation on its own — a high-token session with
+strong cache hits and stable cost-per-turn is perfectly healthy.
 
-| Level | Threshold | Action |
-|-------|-----------|--------|
-| Watch | >300K tokens | Monitor — cache may still be efficient |
-| Recommend | >600K tokens | Handoff recommended — context window pressure |
-| Urgent | >900K tokens | Handoff strongly recommended — near capacity |
+| Level | Threshold | Note |
+|-------|-----------|------|
+| Info | >300K tokens | Reported in diagnostics |
 
 ## Efficiency Decay
 
@@ -26,6 +26,14 @@ Cache hit rate is dropping, meaning the model is re-processing context it should
 |-------|-----------|--------|
 | Watch | Cache hit % < 50% after turn 10 | Monitor |
 | Recommend | Cache hit % < 30% after turn 10 | Handoff recommended |
+
+## Combined Context Pressure
+
+When efficiency decay AND cache degradation fire together, context is
+actively degrading quality. This is the strongest handoff signal.
+
+- **Signal**: Both efficiency_decay and cache_degradation triggered
+- **Severity**: Urgent — handoff strongly recommended
 
 ## Rat-holing
 

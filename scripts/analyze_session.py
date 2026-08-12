@@ -16,10 +16,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-PRICE_CHECK_DIR = Path(__file__).resolve().parent.parent.parent / "price-check"
-sys.path.insert(0, str(PRICE_CHECK_DIR))
-
-from main import (
+from price_check.main import (
     _find_session_jsonl,
     _ensure_pricing,
     get_pricing,
@@ -201,23 +198,13 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
     for t in turns:
         all_models.update(t["models"])
 
-    # 1. Token bloat
-    severity = None
-    if total_tok > 900_000:
-        severity = "urgent"
-    elif total_tok > 600_000:
-        severity = "high"
-    elif total_tok > 300_000:
-        severity = "medium"
+    # 1. Token volume (informational only — never drives recommendation)
     triggers.append({
-        "trigger": "token_bloat",
-        "fired": severity is not None,
-        "severity": severity or "none",
+        "trigger": "token_volume",
+        "fired": False,
+        "severity": "info",
         "evidence": {
             "total_tokens": total_tok,
-            "threshold_300k": total_tok > 300_000,
-            "threshold_600k": total_tok > 600_000,
-            "threshold_900k": total_tok > 900_000,
         },
     })
 
@@ -280,7 +267,21 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need > 10"},
         })
 
-    # 4. Rat-holing — repeated tool call patterns with errors
+    # 4. Combined context pressure — efficiency decay + cache degradation together
+    eff_fired = any(t["trigger"] == "efficiency_decay" and t["fired"] for t in triggers)
+    cache_fired = any(t["trigger"] == "cache_degradation" and t["fired"] for t in triggers)
+    combined_fired = eff_fired and cache_fired
+    triggers.append({
+        "trigger": "combined_context_pressure",
+        "fired": combined_fired,
+        "severity": "urgent" if combined_fired else "none",
+        "evidence": {
+            "efficiency_decay_fired": eff_fired,
+            "cache_degradation_fired": cache_fired,
+        },
+    })
+
+    # 5. Rat-holing — repeated tool call patterns with errors
     if n >= 5:
         recent = turns[-5:]
         error_patterns: dict[str, int] = defaultdict(int)
@@ -308,7 +309,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need >= 5"},
         })
 
-    # 5. Model upgrade needed
+    # 6. Model upgrade needed
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)
@@ -333,7 +334,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n})"},
         })
 
-    # 6. Model downgrade possible
+    # 7. Model downgrade possible
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)
