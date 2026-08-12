@@ -23,7 +23,7 @@ A combined toolkit for Claude Code that provides:
 
 ### Agent Handoff
 
-- **6 Health Triggers**: Token bloat, efficiency decay, cache degradation, rat-holing, model upgrade needed, model downgrade possible
+- **7 Health Triggers**: Token bloat, efficiency decay, cache degradation, rat-holing, context utilization, model upgrade needed, model downgrade possible
 - **Per-Turn Analytics**: Tracks tokens, cost, cache hit rates, and tool usage across the session timeline
 - **Severity Levels**: `watch`, `recommend`, `urgent` based on trigger thresholds
 - **Structured Handoffs**: Generates `HANDOFF.md` with context for the next agent

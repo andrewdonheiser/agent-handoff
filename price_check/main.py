@@ -275,7 +275,7 @@ def _has_pricing() -> bool:
 
 
 def _empty_bucket() -> dict:
-    return {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    return {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "max_prompt_tokens": 0}
 
 
 _DISCOUNT = 0.13
@@ -304,6 +304,9 @@ def cost_for_buckets(by_model: dict[str, dict]) -> float | None:
 def merge_buckets(target: dict, source: dict):
     for k in ("calls", "input", "output", "cache_read", "cache_write"):
         target[k] += source[k]
+    target["max_prompt_tokens"] = max(
+        target.get("max_prompt_tokens", 0), source.get("max_prompt_tokens", 0)
+    )
 
 
 def _variant_key(model: str, speed: str, effort: str) -> str:
@@ -1151,10 +1154,13 @@ def _new_model_bucket():
 
 def _accumulate(bucket: dict, usage: dict, speed: str = "", effort: str = ""):
     bucket["calls"] += 1
-    bucket["input"] += usage.get("input_tokens", 0)
+    inp = usage.get("input_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+    bucket["input"] += inp
     bucket["output"] += usage.get("output_tokens", 0)
-    bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+    bucket["cache_read"] += cr
     bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+    bucket["max_prompt_tokens"] = max(bucket.get("max_prompt_tokens", 0), inp + cr)
     if speed:
         bucket["speeds"][speed] += 1
     if effort:
@@ -1341,7 +1347,7 @@ def _compute_state(session_id: str, cwd: str = "") -> dict | None:
                 "cost": cost_for_model(d, model), "tokens": total_tokens(d),
                 "calls": d["calls"], "speed": _abbrev_tag(speed_val),
                 "effort": _abbrev_tag(effort_val),
-                "prompt_tokens": d["input"] + d["cache_read"],
+                "prompt_tokens": d.get("max_prompt_tokens", 0),
                 "model_id": model,
             }
         return out

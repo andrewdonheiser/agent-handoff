@@ -57,9 +57,10 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
     current_errors = 0
     current_calls = 0
     current_max_prompt_tokens = 0
+    current_max_prompt_model = ""
 
     def _flush():
-        nonlocal current_model_buckets, current_tools, current_errors, current_calls, current_max_prompt_tokens
+        nonlocal current_model_buckets, current_tools, current_errors, current_calls, current_max_prompt_tokens, current_max_prompt_model
         if current_model_buckets is None or current_pid is None:
             return
         idx = len(turns)
@@ -72,12 +73,14 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
             "error_count": current_errors,
             "api_calls": current_calls,
             "max_prompt_tokens": current_max_prompt_tokens,
+            "max_prompt_model": current_max_prompt_model,
         })
         current_model_buckets = None
         current_tools = []
         current_errors = 0
         current_calls = 0
         current_max_prompt_tokens = 0
+        current_max_prompt_model = ""
 
     # ── main session file (no fast_path — needs tool_use/tool_result records) ──
     for obj in iter_session_records(jsonl_path, include_subagents=False):
@@ -144,7 +147,10 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
         bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
         bucket["calls"] += 1
         current_calls += 1
-        current_max_prompt_tokens = max(current_max_prompt_tokens, req_input + req_cache_read)
+        req_prompt = req_input + req_cache_read
+        if req_prompt > current_max_prompt_tokens:
+            current_max_prompt_tokens = req_prompt
+            current_max_prompt_model = model
 
     _flush()
 
@@ -306,13 +312,16 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
     if n >= 1:
         last_turn = turns[-1]
         last_prompt_tokens = last_turn["max_prompt_tokens"]
-        last_model = last_turn["models"][0] if last_turn["models"] else ""
+        last_model = last_turn.get("max_prompt_model", "") or (last_turn["models"][0] if last_turn["models"] else "")
         ctx_lim = context_limit(last_model)
 
         compaction_count = 0
         for i in range(1, n):
             prev_ctx = turns[i - 1]["max_prompt_tokens"]
             curr_ctx = turns[i]["max_prompt_tokens"]
+            # Skip cache-priming or near-empty turns (input_tokens ~ 0)
+            if curr_ctx < 1000:
+                continue
             if prev_ctx > 0 and curr_ctx < prev_ctx * 0.6:
                 compaction_count += 1
 
