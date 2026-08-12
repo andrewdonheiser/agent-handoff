@@ -11,12 +11,15 @@ Reuses pricing and path resolution from price-check.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-from price_check.main import (
+_pkg_root = str(Path(__file__).resolve().parent.parent)
+if _pkg_root not in sys.path:
+    sys.path.insert(0, _pkg_root)
+
+from price_check.main import (  # noqa: E402
     _find_session_jsonl,
     _ensure_pricing,
     get_pricing,
@@ -28,30 +31,16 @@ from price_check.main import (
     _NO_PRICING,
     PROJECTS_DIR,
     MAX_JSONL_SIZE,
+    context_limit,
 )
-
-_SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
-_SYSTEM_PREFIXES = ("<system-reminder", "<task-notification", "<command-message")
-
-
-def _is_system_prompt(obj: dict) -> bool:
-    content = obj.get("message", {}).get("content")
-    if isinstance(content, str):
-        for pfx in _SYSTEM_PREFIXES:
-            if content.lstrip().startswith(pfx):
-                return True
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text", "")
-                for pfx in _SYSTEM_PREFIXES:
-                    if text.lstrip().startswith(pfx):
-                        return True
-    return False
+from price_check.parsing import (
+    discover_subagent_files,
+    iter_session_records,
+)
 
 
 def scan_per_turn(jsonl_path: Path) -> list[dict]:
-    """Parse session JSONL into per-turn metrics.
+    """Parse session JSONL into per-turn metrics, including subagent usage.
 
     Returns a list of dicts, one per user turn (promptId), each containing:
       - turn_number, prompt_id
@@ -61,111 +50,125 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
     """
     turns: list[dict] = []
     seen_requests: set[str] = set()
-    system_pids: set[str] = set()
+    pid_to_turn: dict[str, int] = {}
     current_pid = None
-    current_bucket = None
-    current_models: set[str] = set()
+    current_model_buckets: dict[str, dict] | None = None
     current_tools: list[dict] = []
     current_errors = 0
     current_calls = 0
+    current_max_prompt_tokens = 0
+    current_max_prompt_model = ""
 
     def _flush():
-        nonlocal current_bucket, current_models, current_tools, current_errors, current_calls
-        if current_bucket is None or current_pid is None:
+        nonlocal current_model_buckets, current_tools, current_errors, current_calls, current_max_prompt_tokens, current_max_prompt_model
+        if current_model_buckets is None or current_pid is None:
             return
-        model_list = sorted(current_models)
-        cost = None
-        if model_list:
-            cost = 0.0
-            for m in model_list:
-                mbucket = {k: current_bucket[k] for k in ("input", "output", "cache_read", "cache_write")}
-                c = cost_for_model(mbucket, m)
-                if c is not None:
-                    cost += c
+        idx = len(turns)
+        pid_to_turn[current_pid] = idx
         turns.append({
-            "turn_number": len(turns) + 1,
+            "turn_number": idx + 1,
             "prompt_id": current_pid,
-            "input": current_bucket["input"],
-            "output": current_bucket["output"],
-            "cache_read": current_bucket["cache_read"],
-            "cache_write": current_bucket["cache_write"],
-            "total_tokens": total_tokens(current_bucket),
-            "cache_hit_pct": cache_pct(current_bucket),
-            "cost": cost,
-            "models": model_list,
+            "_model_buckets": current_model_buckets,
             "tool_calls": current_tools,
             "error_count": current_errors,
             "api_calls": current_calls,
+            "max_prompt_tokens": current_max_prompt_tokens,
+            "max_prompt_model": current_max_prompt_model,
         })
-        current_bucket = None
-        current_models = set()
+        current_model_buckets = None
         current_tools = []
         current_errors = 0
         current_calls = 0
+        current_max_prompt_tokens = 0
+        current_max_prompt_model = ""
 
-    try:
-        fh = jsonl_path.open()
-    except OSError:
-        return []
+    # ── main session file (no fast_path — needs tool_use/tool_result records) ──
+    for obj in iter_session_records(jsonl_path, include_subagents=False):
+        pid = obj["_parsed_prompt_id"]
+        is_system = obj["_parsed_is_system"]
 
-    with fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+        if is_system:
+            continue
 
-            pid = obj.get("promptId")
+        if pid and pid != current_pid:
+            _flush()
+            current_pid = pid
+            current_model_buckets = defaultdict(_empty_bucket)
 
-            if pid and pid not in system_pids:
-                if _is_system_prompt(obj):
-                    system_pids.add(pid)
-                    continue
-                if pid != current_pid:
-                    _flush()
-                    current_pid = pid
-                    current_bucket = _empty_bucket()
+        msg = obj.get("message") or {}
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_name = block.get("name", "")
+                        current_tools.append({"name": tool_name, "error": False})
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        is_error = block.get("is_error", False)
+                        if is_error and current_tools:
+                            current_tools[-1]["error"] = True
+                            current_errors += 1
 
-            if pid and pid in system_pids:
-                continue
+        if msg.get("role") == "tool":
+            content = msg.get("content")
+            is_error = False
+            if isinstance(content, str) and ("error" in content.lower() or "Error" in content):
+                is_error = True
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("is_error"):
+                            is_error = True
+                        text = block.get("text", "")
+                        if "error" in text.lower() or "Error" in text:
+                            is_error = True
+            if is_error and current_tools:
+                current_tools[-1]["error"] = True
+                current_errors += 1
 
-            # Tool call tracking
-            msg = obj.get("message") or {}
-            if msg.get("role") == "assistant":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tool_name = block.get("name", "")
-                            current_tools.append({"name": tool_name, "error": False})
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
-                            is_error = block.get("is_error", False)
-                            if is_error and current_tools:
-                                current_tools[-1]["error"] = True
-                                current_errors += 1
+        req_id = obj.get("requestId")
+        if not req_id or req_id in seen_requests:
+            continue
+        usage = msg.get("usage")
+        if not usage or "output_tokens" not in usage:
+            continue
+        seen_requests.add(req_id)
+        model = msg.get("model", "unknown")
+        if model.startswith("<"):
+            continue
+        if current_model_buckets is None:
+            current_model_buckets = defaultdict(_empty_bucket)
+        bucket = current_model_buckets[model]
+        req_input = usage.get("input_tokens", 0)
+        req_cache_read = usage.get("cache_read_input_tokens", 0)
+        bucket["input"] += req_input
+        bucket["output"] += usage.get("output_tokens", 0)
+        bucket["cache_read"] += req_cache_read
+        bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+        bucket["calls"] += 1
+        current_calls += 1
+        req_prompt = req_input + req_cache_read
+        if req_prompt > current_max_prompt_tokens:
+            current_max_prompt_tokens = req_prompt
+            current_max_prompt_model = model
 
-            # Tool result error tracking (tool_result messages)
-            if msg.get("role") == "tool":
-                content = msg.get("content")
-                is_error = False
-                if isinstance(content, str) and ("error" in content.lower() or "Error" in content):
-                    is_error = True
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("is_error"):
-                                is_error = True
-                            text = block.get("text", "")
-                            if "error" in text.lower() or "Error" in text:
-                                is_error = True
-                if is_error and current_tools:
-                    current_tools[-1]["error"] = True
-                    current_errors += 1
+    _flush()
 
-            # Usage accumulation
+    # ── subagent files ──
+    for sf in discover_subagent_files(jsonl_path):
+        file_pids: set[str] = set()
+        file_model_buckets: dict[str, dict] = defaultdict(_empty_bucket)
+        file_calls = 0
+
+        for obj in iter_session_records(sf, include_subagents=False, fast_path=True):
+            pid = obj["_parsed_prompt_id"]
+            if pid:
+                file_pids.add(pid)
+
             req_id = obj.get("requestId")
             if not req_id or req_id in seen_requests:
                 continue
+            msg = obj.get("message") or {}
             usage = msg.get("usage")
             if not usage or "output_tokens" not in usage:
                 continue
@@ -173,16 +176,59 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
             model = msg.get("model", "unknown")
             if model.startswith("<"):
                 continue
-            if current_bucket is None:
-                current_bucket = _empty_bucket()
-            current_bucket["input"] += usage.get("input_tokens", 0)
-            current_bucket["output"] += usage.get("output_tokens", 0)
-            current_bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
-            current_bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
-            current_models.add(model)
-            current_calls += 1
+            bucket = file_model_buckets[model]
+            bucket["input"] += usage.get("input_tokens", 0)
+            bucket["output"] += usage.get("output_tokens", 0)
+            bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+            bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+            bucket["calls"] += 1
+            file_calls += 1
 
-    _flush()
+        if not file_model_buckets:
+            continue
+
+        target_idx = None
+        for pid in file_pids:
+            if pid in pid_to_turn:
+                target_idx = pid_to_turn[pid]
+                break
+        if target_idx is None and turns:
+            # No matching promptId — attribute to the last turn as best guess
+            import logging
+            logging.getLogger(__name__).debug(
+                "Subagent file %s has no matching turn promptId; attributing to last turn", sf.name,
+            )
+            target_idx = len(turns) - 1
+
+        if target_idx is not None:
+            turn_mb = turns[target_idx]["_model_buckets"]
+            for model, sub_bucket in file_model_buckets.items():
+                for k in ("input", "output", "cache_read", "cache_write", "calls"):
+                    turn_mb[model][k] += sub_bucket[k]
+            turns[target_idx]["api_calls"] += file_calls
+
+    # ── finalize: compute derived fields from per-model buckets ──
+    for t in turns:
+        mb = t.pop("_model_buckets")
+        combined = _empty_bucket()
+        cost = 0.0
+        for model, bucket in mb.items():
+            for k in ("input", "output", "cache_read", "cache_write"):
+                combined[k] += bucket[k]
+            c = cost_for_model(bucket, model)
+            if c is not None:
+                cost += c
+        t.update({
+            "input": combined["input"],
+            "output": combined["output"],
+            "cache_read": combined["cache_read"],
+            "cache_write": combined["cache_write"],
+            "total_tokens": total_tokens(combined),
+            "cache_hit_pct": cache_pct(combined),
+            "cost": cost,
+            "models": sorted(mb.keys()),
+        })
+
     return turns
 
 
@@ -267,10 +313,66 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need > 10"},
         })
 
-    # 4. Combined context pressure — efficiency decay + cache degradation together
+    # 4. Context utilization — how full is the context window
+    if n >= 1:
+        last_turn = turns[-1]
+        last_prompt_tokens = last_turn["max_prompt_tokens"]
+        last_model = last_turn.get("max_prompt_model", "") or (last_turn["models"][0] if last_turn["models"] else "")
+        ctx_lim = context_limit(last_model)
+
+        # Detect compaction: a 40%+ drop in prompt tokens between consecutive
+        # turns suggests context was summarized/compacted. Skip near-empty turns
+        # (<1K tokens) to avoid false positives from cache-priming requests.
+        compaction_count = 0
+        for i in range(1, n):
+            prev_ctx = turns[i - 1]["max_prompt_tokens"]
+            curr_ctx = turns[i]["max_prompt_tokens"]
+            if curr_ctx < 1000:
+                continue
+            if prev_ctx > 0 and curr_ctx < prev_ctx * 0.6:
+                compaction_count += 1
+
+        if ctx_lim:
+            utilization = last_prompt_tokens / ctx_lim
+            fired = utilization > 0.8 or compaction_count >= 2
+            if utilization > 0.9 or compaction_count >= 3:
+                sev = "high"
+            elif fired:
+                sev = "medium"
+            else:
+                sev = "none"
+            triggers.append({
+                "trigger": "context_utilization",
+                "fired": fired,
+                "severity": sev,
+                "evidence": {
+                    "current_utilization_pct": round(utilization * 100, 1),
+                    "prompt_tokens": last_prompt_tokens,
+                    "context_limit": ctx_lim,
+                    "compaction_count": compaction_count,
+                    "model": last_model,
+                },
+            })
+        else:
+            triggers.append({
+                "trigger": "context_utilization",
+                "fired": False,
+                "severity": "none",
+                "evidence": {"reason": f"unknown context limit for model {last_model}"},
+            })
+    else:
+        triggers.append({
+            "trigger": "context_utilization",
+            "fired": False,
+            "severity": "none",
+            "evidence": {"reason": "no turns"},
+        })
+
+    # 5. Combined context pressure — multiple context-related signals together
     eff_fired = any(t["trigger"] == "efficiency_decay" and t["fired"] for t in triggers)
     cache_fired = any(t["trigger"] == "cache_degradation" and t["fired"] for t in triggers)
-    combined_fired = eff_fired and cache_fired
+    ctx_fired = any(t["trigger"] == "context_utilization" and t["fired"] for t in triggers)
+    combined_fired = (eff_fired and cache_fired) or (ctx_fired and (eff_fired or cache_fired))
     triggers.append({
         "trigger": "combined_context_pressure",
         "fired": combined_fired,
@@ -278,10 +380,11 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
         "evidence": {
             "efficiency_decay_fired": eff_fired,
             "cache_degradation_fired": cache_fired,
+            "context_utilization_fired": ctx_fired,
         },
     })
 
-    # 5. Rat-holing — repeated tool call patterns with errors
+    # 6. Rat-holing — repeated tool call patterns with errors
     if n >= 5:
         recent = turns[-5:]
         error_patterns: dict[str, int] = defaultdict(int)
@@ -309,7 +412,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need >= 5"},
         })
 
-    # 6. Model upgrade needed
+    # 7. Model upgrade needed
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)
@@ -334,7 +437,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n})"},
         })
 
-    # 7. Model downgrade possible
+    # 8. Model downgrade possible
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)

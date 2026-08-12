@@ -23,7 +23,7 @@ A combined toolkit for Claude Code that provides:
 
 ### Agent Handoff
 
-- **6 Health Triggers**: Token bloat, efficiency decay, cache degradation, rat-holing, model upgrade needed, model downgrade possible
+- **7 Health Triggers**: Token bloat, efficiency decay, cache degradation, rat-holing, context utilization, model upgrade needed, model downgrade possible
 - **Per-Turn Analytics**: Tracks tokens, cost, cache hit rates, and tool usage across the session timeline
 - **Severity Levels**: `watch`, `recommend`, `urgent` based on trigger thresholds
 - **Structured Handoffs**: Generates `HANDOFF.md` with context for the next agent
@@ -173,11 +173,14 @@ See [SKILL.md](SKILL.md) for the full procedure and [references/](references/) f
 agent-handoff/
 ├── price_check/
 │   ├── __init__.py               # Public API exports
-│   └── main.py                   # Token usage CLI, hooks, status line
+│   ├── main.py                   # Token usage CLI, hooks, status line
+│   └── parsing.py                # Shared JSONL parsing (iter_session_records, system prompt detection)
 ├── scripts/
 │   └── analyze_session.py        # Session health analyzer (imports from price_check)
 ├── tests/
-│   └── test_price_check.py       # Test suite
+│   ├── test_price_check.py       # Price check test suite
+│   ├── test_analyze_session.py   # Session analyzer test suite
+│   └── test_parsing.py           # Parsing module test suite
 ├── references/
 │   ├── handoff-guide.md          # Handoff best practices & model selection
 │   └── handoff-triggers.md       # Trigger definitions & thresholds

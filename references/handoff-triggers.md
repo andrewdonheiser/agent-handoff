@@ -27,12 +27,27 @@ Cache hit rate is dropping, meaning the model is re-processing context it should
 | Watch | Cache hit % < 50% after turn 10 | Monitor |
 | Recommend | Cache hit % < 30% after turn 10 | Handoff recommended |
 
+## Context Utilization
+
+Measures how full the context window is and detects compaction events.
+
+- **Signal**: Largest single-request prompt tokens (input + cache_read) compared to the model's context limit. Also counts compaction events — when prompt tokens drop 40%+ between consecutive turns, indicating context was summarized.
+- **Thresholds**:
+
+| Level | Condition |
+|-------|-----------|
+| Medium | Utilization >80% OR 2+ compaction events |
+| High | Utilization >90% OR 3+ compaction events |
+
+- **Context limits**: 200K tokens for all current Claude models (Opus, Sonnet, Haiku, Fable)
+- **Why it matters**: High utilization means compaction is imminent or already happening. Multiple compactions mean the model is losing earlier context and may produce less coherent responses.
+
 ## Combined Context Pressure
 
-When efficiency decay AND cache degradation fire together, context is
+When multiple context-related signals fire together, context is
 actively degrading quality. This is the strongest handoff signal.
 
-- **Signal**: Both efficiency_decay and cache_degradation triggered
+- **Signal**: (efficiency_decay AND cache_degradation) OR (context_utilization AND either efficiency_decay or cache_degradation)
 - **Severity**: Urgent — handoff strongly recommended
 
 ## Rat-holing

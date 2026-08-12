@@ -22,8 +22,18 @@ from collections import defaultdict
 from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
+_pkg_root = str(Path(__file__).resolve().parent.parent)
+if _pkg_root not in sys.path:
+    sys.path.insert(0, _pkg_root)
+
+from price_check.parsing import (  # noqa: E402
+    _is_system_prompt,
+    _SYSTEM_PREFIXES,
+    discover_subagent_files,
+    iter_session_records,
+)
+
 MAX_JSONL_SIZE = 100 * 1024 * 1024  # 100 MB
-_SYSTEM_PREFIXES = ("<system-reminder", "<task-notification", "<command-message")
 _TAG_ABBREV = {"standard": "std", "medium": "med", "high": "hi", "fast": "fast"}
 PERIOD_CACHE_TTL = 60  # seconds - how long to cache period totals (today/week/month)
 
@@ -265,7 +275,7 @@ def _has_pricing() -> bool:
 
 
 def _empty_bucket() -> dict:
-    return {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    return {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "max_prompt_tokens": 0}
 
 
 _DISCOUNT = 0.13
@@ -294,6 +304,9 @@ def cost_for_buckets(by_model: dict[str, dict]) -> float | None:
 def merge_buckets(target: dict, source: dict):
     for k in ("calls", "input", "output", "cache_read", "cache_write"):
         target[k] += source[k]
+    target["max_prompt_tokens"] = max(
+        target.get("max_prompt_tokens", 0), source.get("max_prompt_tokens", 0)
+    )
 
 
 def _variant_key(model: str, speed: str, effort: str) -> str:
@@ -360,6 +373,21 @@ def prompt_tokens(d: dict) -> int:
     return d["input"] + d["cache_read"]
 
 
+CONTEXT_LIMITS = {
+    "claude-opus": 200_000,
+    "claude-sonnet": 200_000,
+    "claude-haiku": 200_000,
+    "claude-fable": 200_000,
+}
+
+
+def context_limit(model_id: str) -> int | None:
+    for prefix, limit in CONTEXT_LIMITS.items():
+        if model_id.startswith(prefix):
+            return limit
+    return None
+
+
 def cost_color(c_val: float | None) -> int:
     if c_val is None: return 245
     if c_val < 1:  return 78
@@ -409,16 +437,6 @@ def model_color(label: str) -> int:
     return MODEL_COLORS.get(label, 245)
 
 
-def _is_system_prompt(obj: dict) -> bool:
-    msg_content = (obj.get("message") or {}).get("content", "")
-    if isinstance(msg_content, list):
-        msg_content = (msg_content[0].get("text", "")
-                       if msg_content and isinstance(msg_content[0], dict) else "")
-    return isinstance(msg_content, str) and any(
-        msg_content.lstrip().startswith(p) for p in _SYSTEM_PREFIXES
-    )
-
-
 # ── Scanners ──────────────────────────────────────────────────────────
 
 def scan_jsonl_files(days: int) -> tuple[dict[str, dict[str, dict]], dict[str, int]]:
@@ -436,58 +454,47 @@ def scan_jsonl_files(days: int) -> tuple[dict[str, dict[str, dict]], dict[str, i
             continue
         if stat.st_mtime < cutoff_ts or stat.st_size > MAX_JSONL_SIZE:
             continue
-        system_pids: set[str] = set()
-        with jsonl.open() as f:
-            for line in f:
-                has_usage = '"usage"' in line
-                has_pid = '"promptId"' in line
-                if not has_usage and not has_pid:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if has_pid:
-                    pid = obj.get("promptId")
-                    if pid and _is_system_prompt(obj):
-                        system_pids.add(pid)
-                    ts_str = obj.get("timestamp")
-                    if pid and ts_str and pid not in system_pids:
-                        try:
-                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        except ValueError:
-                            pass
-                        else:
-                            if ts >= cutoff:
-                                day = ts.astimezone().strftime("%Y-%m-%d")
-                                daily_prompt_ids[day].add(pid)
-                if not has_usage:
-                    continue
-                req_id = obj.get("requestId")
-                if not req_id or req_id in seen:
-                    continue
-                msg = obj.get("message") or {}
-                usage = msg.get("usage")
-                if not usage or "output_tokens" not in usage:
-                    continue
-                seen.add(req_id)
+        for obj in iter_session_records(jsonl, include_subagents=False, fast_path=True):
+            pid = obj["_parsed_prompt_id"]
+            is_system = obj["_parsed_is_system"]
+
+            if pid and not is_system:
                 ts_str = obj.get("timestamp")
-                if not ts_str:
-                    continue
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if ts < cutoff:
-                    continue
-                day = ts.astimezone().strftime("%Y-%m-%d")
-                model = msg.get("model", "unknown")
-                if model.startswith("<"):
-                    continue
-                speed = usage.get("speed", "")
-                effort = obj.get("effort", "")
-                vkey = _variant_key(model, speed, effort)
-                _accumulate(daily[day][vkey], usage, speed, effort)
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                    else:
+                        if ts >= cutoff:
+                            day = ts.astimezone().strftime("%Y-%m-%d")
+                            daily_prompt_ids[day].add(pid)
+
+            req_id = obj.get("requestId")
+            if not req_id or req_id in seen:
+                continue
+            msg = obj.get("message") or {}
+            usage = msg.get("usage")
+            if not usage or "output_tokens" not in usage:
+                continue
+            seen.add(req_id)
+            ts_str = obj.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            day = ts.astimezone().strftime("%Y-%m-%d")
+            model = msg.get("model", "unknown")
+            if model.startswith("<"):
+                continue
+            speed = usage.get("speed", "")
+            effort = obj.get("effort", "")
+            vkey = _variant_key(model, speed, effort)
+            _accumulate(daily[day][vkey], usage, speed, effort)
 
     daily_turns = {day: len(pids) for day, pids in daily_prompt_ids.items()}
     return dict(daily), daily_turns
@@ -1147,10 +1154,13 @@ def _new_model_bucket():
 
 def _accumulate(bucket: dict, usage: dict, speed: str = "", effort: str = ""):
     bucket["calls"] += 1
-    bucket["input"] += usage.get("input_tokens", 0)
+    inp = usage.get("input_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+    bucket["input"] += inp
     bucket["output"] += usage.get("output_tokens", 0)
-    bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+    bucket["cache_read"] += cr
     bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+    bucket["max_prompt_tokens"] = max(bucket.get("max_prompt_tokens", 0), inp + cr)
     if speed:
         bucket["speeds"][speed] += 1
     if effort:
@@ -1165,100 +1175,64 @@ def _scan_session_usage(jsonl_path: Path) -> tuple[dict, dict, dict, dict, int]:
     by_agent: dict[str, int] = defaultdict(int)
     last_agents: dict[str, int] = defaultdict(int)
 
-    subagent_files: list[Path] = []
-    subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
-    if subagents_dir.is_dir():
-        subagent_files = list(subagents_dir.rglob("agent-*.jsonl"))
-
     latest_prompt_id = None
-    system_pids: set[str] = set()
-
-    # ── main session file ──
     all_prompt_ids: set[str] = set()
+    subagent_file_state: dict[Path, dict] = {}
 
-    try:
-        fh = jsonl_path.open()
-    except OSError:
-        return {}, {}, {}, {}, 0
-    with fh:
-        for line in fh:
-            if '"usage"' not in line and '"promptId"' not in line:
-                continue
-            try:
-                obj = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            pid = obj.get("promptId")
-            if pid and pid != latest_prompt_id and pid not in system_pids:
-                if _is_system_prompt(obj):
-                    system_pids.add(pid)
-                else:
+    for obj in iter_session_records(jsonl_path, fast_path=True):
+        pid = obj["_parsed_prompt_id"]
+        source = obj["_parsed_source"]
+        is_system = obj["_parsed_is_system"]
+
+        if source == "main":
+            if pid and not is_system:
+                if pid != latest_prompt_id:
                     latest_prompt_id = pid
                     last_by_model = defaultdict(_new_model_bucket)
-            if pid and pid not in system_pids:
                 all_prompt_ids.add(pid)
-            req_id = obj.get("requestId")
-            if not req_id or req_id in seen:
-                continue
-            msg = obj.get("message") or {}
-            usage = msg.get("usage")
-            if not usage or "output_tokens" not in usage:
-                continue
-            seen.add(req_id)
-            model = msg.get("model", "unknown")
-            if model.startswith("<"):
-                continue
-            speed = usage.get("speed", "")
-            effort = obj.get("effort", "")
+        else:
+            sf = obj["_parsed_subagent_file"]
+            if sf not in subagent_file_state:
+                subagent_file_state[sf] = {
+                    "agent_type": "",
+                    "prompt_ids": set(),
+                    "file_usage": defaultdict(_new_model_bucket),
+                }
+            state = subagent_file_state[sf]
+            if not state["agent_type"]:
+                state["agent_type"] = obj.get("_parsed_attribution_agent", "")
+            if pid:
+                state["prompt_ids"].add(pid)
+
+        req_id = obj.get("requestId")
+        if not req_id or req_id in seen:
+            continue
+        msg = obj.get("message") or {}
+        usage = msg.get("usage")
+        if not usage or "output_tokens" not in usage:
+            continue
+        seen.add(req_id)
+        model = msg.get("model", "unknown")
+        if model.startswith("<"):
+            continue
+        speed = usage.get("speed", "")
+        effort = obj.get("effort", "")
+
+        if source == "main":
             for bucket in (by_model[model], last_by_model[model]):
                 _accumulate(bucket, usage, speed, effort)
+        else:
+            _accumulate(by_model[model], usage, speed, effort)
+            _accumulate(subagent_file_state[sf]["file_usage"][model], usage, speed, effort)
 
-    # ── subagent files ──
-    for sf in subagent_files:
-        agent_type = ""
-        file_prompt_ids: set[str] = set()
-        file_usage: dict[str, dict] = defaultdict(_new_model_bucket)
-
-        try:
-            sfh = sf.open()
-        except OSError:
-            continue
-        with sfh:
-            for line in sfh:
-                if '"usage"' not in line and '"promptId"' not in line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                pid = obj.get("promptId")
-                if pid:
-                    file_prompt_ids.add(pid)
-                req_id = obj.get("requestId")
-                if not req_id or req_id in seen:
-                    continue
-                msg = obj.get("message") or {}
-                usage = msg.get("usage")
-                if not usage or "output_tokens" not in usage:
-                    continue
-                seen.add(req_id)
-                if not agent_type:
-                    agent_type = obj.get("attributionAgent", "")
-                model = msg.get("model", "unknown")
-                if model.startswith("<"):
-                    continue
-                speed = usage.get("speed", "")
-                effort = obj.get("effort", "")
-                for bucket in (by_model[model], file_usage[model]):
-                    _accumulate(bucket, usage, speed, effort)
-
-        is_current = (not latest_prompt_id) or (latest_prompt_id in file_prompt_ids)
-        if agent_type:
-            by_agent[agent_type] += 1
+    for sf, state in subagent_file_state.items():
+        is_current = (not latest_prompt_id) or (latest_prompt_id in state["prompt_ids"])
+        if state["agent_type"]:
+            by_agent[state["agent_type"]] += 1
             if is_current:
-                last_agents[agent_type] += 1
+                last_agents[state["agent_type"]] += 1
         if is_current:
-            for model, fu in file_usage.items():
+            for model, fu in state["file_usage"].items():
                 lm = last_by_model[model]
                 merge_buckets(lm, fu)
                 for s, cnt in fu["speeds"].items():
@@ -1373,6 +1347,8 @@ def _compute_state(session_id: str, cwd: str = "") -> dict | None:
                 "cost": cost_for_model(d, model), "tokens": total_tokens(d),
                 "calls": d["calls"], "speed": _abbrev_tag(speed_val),
                 "effort": _abbrev_tag(effort_val),
+                "prompt_tokens": d.get("max_prompt_tokens", 0),
+                "model_id": model,
             }
         return out
 
@@ -1457,14 +1433,20 @@ def run_status_line():
     if not state or not state.get("by_model"):
         state = _compute_state(session_id, ctx.get("cwd", ""))
 
-    def _fmt_model_line(models: dict, prefix: str, agents: dict | None = None) -> str:
+    def _fmt_model_line(models: dict, prefix: str, agents: dict | None = None, show_context: bool = False) -> str:
         total_cost = sum(m.get("cost") or 0 for m in models.values())
         parts = []
         for label in sorted(models, key=lambda m: models[m].get("tokens", 0), reverse=True):
             mc = models[label]
             tags = [t for t in [mc.get("speed", ""), mc.get("effort", "")] if t]
             tag_str = f" [{','.join(tags)}]" if tags else ""
-            parts.append(f"{label}: {fmt_cost(mc['cost'])} ({fmt_tokens(mc['tokens'])}){tag_str}")
+            ctx_str = ""
+            if show_context:
+                ctx_tokens = mc.get("prompt_tokens", 0)
+                ctx_lim = context_limit(mc.get("model_id", ""))
+                if ctx_tokens and ctx_lim:
+                    ctx_str = f" ctx:{fmt_tokens(ctx_tokens)}/{fmt_tokens(ctx_lim)}"
+            parts.append(f"{label}: {fmt_cost(mc['cost'])} ({fmt_tokens(mc['tokens'])}){ctx_str}{tag_str}")
         if agents:
             agent_parts = []
             for atype in sorted(agents, key=lambda a: agents[a], reverse=True):
@@ -1487,7 +1469,7 @@ def run_status_line():
     last_agents = state.get("last_agents", {})
     session_agents = state.get("agents", {})
 
-    print(_fmt_model_line(last_by_model, "Prompt", last_agents) if last_by_model else f"Prompt: {fmt_cost(state.get('last_cost', 0))}")
+    print(_fmt_model_line(last_by_model, "Prompt", last_agents, show_context=True) if last_by_model else f"Prompt: {fmt_cost(state.get('last_cost', 0))}")
     print(_fmt_model_line(by_model, "Session", session_agents))
 
     today_period = state.get("today_by_model", {})
