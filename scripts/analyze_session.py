@@ -11,12 +11,15 @@ Reuses pricing and path resolution from price-check.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-from price_check.main import (
+_pkg_root = str(Path(__file__).resolve().parent.parent)
+if _pkg_root not in sys.path:
+    sys.path.insert(0, _pkg_root)
+
+from price_check.main import (  # noqa: E402
     _find_session_jsonl,
     _ensure_pricing,
     get_pricing,
@@ -29,25 +32,10 @@ from price_check.main import (
     PROJECTS_DIR,
     MAX_JSONL_SIZE,
 )
-
-_SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
-_SYSTEM_PREFIXES = ("<system-reminder", "<task-notification", "<command-message")
-
-
-def _is_system_prompt(obj: dict) -> bool:
-    content = obj.get("message", {}).get("content")
-    if isinstance(content, str):
-        for pfx in _SYSTEM_PREFIXES:
-            if content.lstrip().startswith(pfx):
-                return True
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text", "")
-                for pfx in _SYSTEM_PREFIXES:
-                    if text.lstrip().startswith(pfx):
-                        return True
-    return False
+from price_check.parsing import (
+    discover_subagent_files,
+    iter_session_records,
+)
 
 
 def scan_per_turn(jsonl_path: Path) -> list[dict]:
@@ -61,7 +49,6 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
     """
     turns: list[dict] = []
     seen_requests: set[str] = set()
-    system_pids: set[str] = set()
     pid_to_turn: dict[str, int] = {}
     current_pid = None
     current_model_buckets: dict[str, dict] | None = None
@@ -88,69 +75,87 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
         current_errors = 0
         current_calls = 0
 
-    try:
-        fh = jsonl_path.open()
-    except OSError:
-        return []
+    # ── main session file (no fast_path — needs tool_use/tool_result records) ──
+    for obj in iter_session_records(jsonl_path, include_subagents=False):
+        pid = obj["_parsed_prompt_id"]
+        is_system = obj["_parsed_is_system"]
 
-    with fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+        if is_system:
+            continue
 
-            pid = obj.get("promptId")
+        if pid and pid != current_pid:
+            _flush()
+            current_pid = pid
+            current_model_buckets = defaultdict(_empty_bucket)
 
-            if pid and pid not in system_pids:
-                if _is_system_prompt(obj):
-                    system_pids.add(pid)
-                    continue
-                if pid != current_pid:
-                    _flush()
-                    current_pid = pid
-                    current_model_buckets = defaultdict(_empty_bucket)
+        msg = obj.get("message") or {}
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_name = block.get("name", "")
+                        current_tools.append({"name": tool_name, "error": False})
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        is_error = block.get("is_error", False)
+                        if is_error and current_tools:
+                            current_tools[-1]["error"] = True
+                            current_errors += 1
 
-            if pid and pid in system_pids:
-                continue
+        if msg.get("role") == "tool":
+            content = msg.get("content")
+            is_error = False
+            if isinstance(content, str) and ("error" in content.lower() or "Error" in content):
+                is_error = True
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("is_error"):
+                            is_error = True
+                        text = block.get("text", "")
+                        if "error" in text.lower() or "Error" in text:
+                            is_error = True
+            if is_error and current_tools:
+                current_tools[-1]["error"] = True
+                current_errors += 1
 
-            # Tool call tracking
-            msg = obj.get("message") or {}
-            if msg.get("role") == "assistant":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tool_name = block.get("name", "")
-                            current_tools.append({"name": tool_name, "error": False})
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
-                            is_error = block.get("is_error", False)
-                            if is_error and current_tools:
-                                current_tools[-1]["error"] = True
-                                current_errors += 1
+        req_id = obj.get("requestId")
+        if not req_id or req_id in seen_requests:
+            continue
+        usage = msg.get("usage")
+        if not usage or "output_tokens" not in usage:
+            continue
+        seen_requests.add(req_id)
+        model = msg.get("model", "unknown")
+        if model.startswith("<"):
+            continue
+        if current_model_buckets is None:
+            current_model_buckets = defaultdict(_empty_bucket)
+        bucket = current_model_buckets[model]
+        bucket["input"] += usage.get("input_tokens", 0)
+        bucket["output"] += usage.get("output_tokens", 0)
+        bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+        bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+        bucket["calls"] += 1
+        current_calls += 1
 
-            # Tool result error tracking (tool_result messages)
-            if msg.get("role") == "tool":
-                content = msg.get("content")
-                is_error = False
-                if isinstance(content, str) and ("error" in content.lower() or "Error" in content):
-                    is_error = True
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("is_error"):
-                                is_error = True
-                            text = block.get("text", "")
-                            if "error" in text.lower() or "Error" in text:
-                                is_error = True
-                if is_error and current_tools:
-                    current_tools[-1]["error"] = True
-                    current_errors += 1
+    _flush()
 
-            # Usage accumulation — per-model buckets
+    # ── subagent files ──
+    for sf in discover_subagent_files(jsonl_path):
+        file_pids: set[str] = set()
+        file_model_buckets: dict[str, dict] = defaultdict(_empty_bucket)
+        file_calls = 0
+
+        for obj in iter_session_records(sf, include_subagents=False, fast_path=True):
+            pid = obj["_parsed_prompt_id"]
+            if pid:
+                file_pids.add(pid)
+
             req_id = obj.get("requestId")
             if not req_id or req_id in seen_requests:
                 continue
+            msg = obj.get("message") or {}
             usage = msg.get("usage")
             if not usage or "output_tokens" not in usage:
                 continue
@@ -158,79 +163,31 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
             model = msg.get("model", "unknown")
             if model.startswith("<"):
                 continue
-            if current_model_buckets is None:
-                current_model_buckets = defaultdict(_empty_bucket)
-            bucket = current_model_buckets[model]
+            bucket = file_model_buckets[model]
             bucket["input"] += usage.get("input_tokens", 0)
             bucket["output"] += usage.get("output_tokens", 0)
             bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
             bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
             bucket["calls"] += 1
-            current_calls += 1
+            file_calls += 1
 
-    _flush()
+        if not file_model_buckets:
+            continue
 
-    # ── subagent files ──
-    subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
-    if subagents_dir.is_dir():
-        for sf in subagents_dir.rglob("agent-*.jsonl"):
-            try:
-                sfh = sf.open()
-            except OSError:
-                continue
+        target_idx = None
+        for pid in file_pids:
+            if pid in pid_to_turn:
+                target_idx = pid_to_turn[pid]
+                break
+        if target_idx is None and turns:
+            target_idx = len(turns) - 1
 
-            file_pids: set[str] = set()
-            file_model_buckets: dict[str, dict] = defaultdict(_empty_bucket)
-            file_calls = 0
-
-            with sfh:
-                for line in sfh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-
-                    pid = obj.get("promptId")
-                    if pid:
-                        file_pids.add(pid)
-
-                    req_id = obj.get("requestId")
-                    if not req_id or req_id in seen_requests:
-                        continue
-                    msg = obj.get("message") or {}
-                    usage = msg.get("usage")
-                    if not usage or "output_tokens" not in usage:
-                        continue
-                    seen_requests.add(req_id)
-                    model = msg.get("model", "unknown")
-                    if model.startswith("<"):
-                        continue
-                    bucket = file_model_buckets[model]
-                    bucket["input"] += usage.get("input_tokens", 0)
-                    bucket["output"] += usage.get("output_tokens", 0)
-                    bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
-                    bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
-                    bucket["calls"] += 1
-                    file_calls += 1
-
-            if not file_model_buckets:
-                continue
-
-            # Assign subagent usage to the parent turn by promptId match
-            target_idx = None
-            for pid in file_pids:
-                if pid in pid_to_turn:
-                    target_idx = pid_to_turn[pid]
-                    break
-            if target_idx is None and turns:
-                target_idx = len(turns) - 1
-
-            if target_idx is not None:
-                turn_mb = turns[target_idx]["_model_buckets"]
-                for model, sub_bucket in file_model_buckets.items():
-                    for k in ("input", "output", "cache_read", "cache_write", "calls"):
-                        turn_mb[model][k] += sub_bucket[k]
-                turns[target_idx]["api_calls"] += file_calls
+        if target_idx is not None:
+            turn_mb = turns[target_idx]["_model_buckets"]
+            for model, sub_bucket in file_model_buckets.items():
+                for k in ("input", "output", "cache_read", "cache_write", "calls"):
+                    turn_mb[model][k] += sub_bucket[k]
+            turns[target_idx]["api_calls"] += file_calls
 
     # ── finalize: compute derived fields from per-model buckets ──
     for t in turns:
