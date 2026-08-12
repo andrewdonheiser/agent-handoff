@@ -3,7 +3,13 @@
 A combined toolkit for Claude Code that provides:
 
 1. **Price Check** — CLI tool and status line integration for tracking Claude Code token usage and costs
+<img width="939" height="208" alt="Screenshot 2026-08-12 at 4 37 11 PM" src="https://github.com/user-attachments/assets/f27cdf7f-999e-4ae5-9069-117ce0e41a04" />
+
 2. **Agent Handoff** — Skill that analyzes session health and generates structured handoff documents
+
+
+
+<img width="1566" height="575" alt="Screenshot 2026-08-12 at 4 35 44 PM" src="https://github.com/user-attachments/assets/39c998c4-02f2-4709-9493-a8d9df3515e1" />
 
 ## Features
 
