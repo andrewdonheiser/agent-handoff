@@ -31,6 +31,7 @@ from price_check.main import (  # noqa: E402
     _NO_PRICING,
     PROJECTS_DIR,
     MAX_JSONL_SIZE,
+    context_limit,
 )
 from price_check.parsing import (
     discover_subagent_files,
@@ -55,9 +56,10 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
     current_tools: list[dict] = []
     current_errors = 0
     current_calls = 0
+    current_max_prompt_tokens = 0
 
     def _flush():
-        nonlocal current_model_buckets, current_tools, current_errors, current_calls
+        nonlocal current_model_buckets, current_tools, current_errors, current_calls, current_max_prompt_tokens
         if current_model_buckets is None or current_pid is None:
             return
         idx = len(turns)
@@ -69,11 +71,13 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
             "tool_calls": current_tools,
             "error_count": current_errors,
             "api_calls": current_calls,
+            "max_prompt_tokens": current_max_prompt_tokens,
         })
         current_model_buckets = None
         current_tools = []
         current_errors = 0
         current_calls = 0
+        current_max_prompt_tokens = 0
 
     # ── main session file (no fast_path — needs tool_use/tool_result records) ──
     for obj in iter_session_records(jsonl_path, include_subagents=False):
@@ -132,12 +136,15 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
         if current_model_buckets is None:
             current_model_buckets = defaultdict(_empty_bucket)
         bucket = current_model_buckets[model]
-        bucket["input"] += usage.get("input_tokens", 0)
+        req_input = usage.get("input_tokens", 0)
+        req_cache_read = usage.get("cache_read_input_tokens", 0)
+        bucket["input"] += req_input
         bucket["output"] += usage.get("output_tokens", 0)
-        bucket["cache_read"] += usage.get("cache_read_input_tokens", 0)
+        bucket["cache_read"] += req_cache_read
         bucket["cache_write"] += usage.get("cache_creation_input_tokens", 0)
         bucket["calls"] += 1
         current_calls += 1
+        current_max_prompt_tokens = max(current_max_prompt_tokens, req_input + req_cache_read)
 
     _flush()
 
@@ -295,10 +302,61 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need > 10"},
         })
 
-    # 4. Combined context pressure — efficiency decay + cache degradation together
+    # 4. Context utilization — how full is the context window
+    if n >= 1:
+        last_turn = turns[-1]
+        last_prompt_tokens = last_turn["max_prompt_tokens"]
+        last_model = last_turn["models"][0] if last_turn["models"] else ""
+        ctx_lim = context_limit(last_model)
+
+        compaction_count = 0
+        for i in range(1, n):
+            prev_ctx = turns[i - 1]["max_prompt_tokens"]
+            curr_ctx = turns[i]["max_prompt_tokens"]
+            if prev_ctx > 0 and curr_ctx < prev_ctx * 0.6:
+                compaction_count += 1
+
+        if ctx_lim:
+            utilization = last_prompt_tokens / ctx_lim
+            fired = utilization > 0.8 or compaction_count >= 2
+            if utilization > 0.9 or compaction_count >= 3:
+                sev = "high"
+            elif fired:
+                sev = "medium"
+            else:
+                sev = "none"
+            triggers.append({
+                "trigger": "context_utilization",
+                "fired": fired,
+                "severity": sev,
+                "evidence": {
+                    "current_utilization_pct": round(utilization * 100, 1),
+                    "prompt_tokens": last_prompt_tokens,
+                    "context_limit": ctx_lim,
+                    "compaction_count": compaction_count,
+                    "model": last_model,
+                },
+            })
+        else:
+            triggers.append({
+                "trigger": "context_utilization",
+                "fired": False,
+                "severity": "none",
+                "evidence": {"reason": f"unknown context limit for model {last_model}"},
+            })
+    else:
+        triggers.append({
+            "trigger": "context_utilization",
+            "fired": False,
+            "severity": "none",
+            "evidence": {"reason": "no turns"},
+        })
+
+    # 5. Combined context pressure — multiple context-related signals together
     eff_fired = any(t["trigger"] == "efficiency_decay" and t["fired"] for t in triggers)
     cache_fired = any(t["trigger"] == "cache_degradation" and t["fired"] for t in triggers)
-    combined_fired = eff_fired and cache_fired
+    ctx_fired = any(t["trigger"] == "context_utilization" and t["fired"] for t in triggers)
+    combined_fired = (eff_fired and cache_fired) or (ctx_fired and (eff_fired or cache_fired))
     triggers.append({
         "trigger": "combined_context_pressure",
         "fired": combined_fired,
@@ -306,10 +364,11 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
         "evidence": {
             "efficiency_decay_fired": eff_fired,
             "cache_degradation_fired": cache_fired,
+            "context_utilization_fired": ctx_fired,
         },
     })
 
-    # 5. Rat-holing — repeated tool call patterns with errors
+    # 6. Rat-holing — repeated tool call patterns with errors
     if n >= 5:
         recent = turns[-5:]
         error_patterns: dict[str, int] = defaultdict(int)
@@ -337,7 +396,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n}), need >= 5"},
         })
 
-    # 6. Model upgrade needed
+    # 7. Model upgrade needed
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)
@@ -362,7 +421,7 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
             "evidence": {"reason": f"insufficient turns ({n})"},
         })
 
-    # 7. Model downgrade possible
+    # 8. Model downgrade possible
     if n >= 5:
         recent = turns[-5:]
         avg_output = sum(t["output"] for t in recent) / len(recent)

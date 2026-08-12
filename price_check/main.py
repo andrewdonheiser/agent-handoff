@@ -370,6 +370,21 @@ def prompt_tokens(d: dict) -> int:
     return d["input"] + d["cache_read"]
 
 
+CONTEXT_LIMITS = {
+    "claude-opus": 200_000,
+    "claude-sonnet": 200_000,
+    "claude-haiku": 200_000,
+    "claude-fable": 200_000,
+}
+
+
+def context_limit(model_id: str) -> int | None:
+    for prefix, limit in CONTEXT_LIMITS.items():
+        if model_id.startswith(prefix):
+            return limit
+    return None
+
+
 def cost_color(c_val: float | None) -> int:
     if c_val is None: return 245
     if c_val < 1:  return 78
@@ -1326,6 +1341,8 @@ def _compute_state(session_id: str, cwd: str = "") -> dict | None:
                 "cost": cost_for_model(d, model), "tokens": total_tokens(d),
                 "calls": d["calls"], "speed": _abbrev_tag(speed_val),
                 "effort": _abbrev_tag(effort_val),
+                "prompt_tokens": d["input"] + d["cache_read"],
+                "model_id": model,
             }
         return out
 
@@ -1410,14 +1427,20 @@ def run_status_line():
     if not state or not state.get("by_model"):
         state = _compute_state(session_id, ctx.get("cwd", ""))
 
-    def _fmt_model_line(models: dict, prefix: str, agents: dict | None = None) -> str:
+    def _fmt_model_line(models: dict, prefix: str, agents: dict | None = None, show_context: bool = False) -> str:
         total_cost = sum(m.get("cost") or 0 for m in models.values())
         parts = []
         for label in sorted(models, key=lambda m: models[m].get("tokens", 0), reverse=True):
             mc = models[label]
             tags = [t for t in [mc.get("speed", ""), mc.get("effort", "")] if t]
             tag_str = f" [{','.join(tags)}]" if tags else ""
-            parts.append(f"{label}: {fmt_cost(mc['cost'])} ({fmt_tokens(mc['tokens'])}){tag_str}")
+            ctx_str = ""
+            if show_context:
+                ctx_tokens = mc.get("prompt_tokens", 0)
+                ctx_lim = context_limit(mc.get("model_id", ""))
+                if ctx_tokens and ctx_lim:
+                    ctx_str = f" ctx:{fmt_tokens(ctx_tokens)}/{fmt_tokens(ctx_lim)}"
+            parts.append(f"{label}: {fmt_cost(mc['cost'])} ({fmt_tokens(mc['tokens'])}){ctx_str}{tag_str}")
         if agents:
             agent_parts = []
             for atype in sorted(agents, key=lambda a: agents[a], reverse=True):
@@ -1440,7 +1463,7 @@ def run_status_line():
     last_agents = state.get("last_agents", {})
     session_agents = state.get("agents", {})
 
-    print(_fmt_model_line(last_by_model, "Prompt", last_agents) if last_by_model else f"Prompt: {fmt_cost(state.get('last_cost', 0))}")
+    print(_fmt_model_line(last_by_model, "Prompt", last_agents, show_context=True) if last_by_model else f"Prompt: {fmt_cost(state.get('last_cost', 0))}")
     print(_fmt_model_line(by_model, "Session", session_agents))
 
     today_period = state.get("today_by_model", {})
