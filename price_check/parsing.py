@@ -75,10 +75,12 @@ def iter_session_records(
             elif pid and pid in system_pids:
                 is_system = True
 
-            obj["_parsed_prompt_id"] = pid
-            obj["_parsed_is_system"] = is_system
-            obj["_parsed_source"] = "main"
-            yield obj
+            yield {
+                **obj,
+                "_parsed_prompt_id": pid,
+                "_parsed_is_system": is_system,
+                "_parsed_source": "main",
+            }
 
     if not include_subagents:
         return
@@ -102,9 +104,11 @@ def iter_session_records(
                     agent_type = obj.get("attributionAgent", "")
 
                 pid = obj.get("promptId")
-                obj["_parsed_prompt_id"] = pid
-                obj["_parsed_is_system"] = False
-                obj["_parsed_source"] = "subagent"
-                obj["_parsed_attribution_agent"] = agent_type
-                obj["_parsed_subagent_file"] = sf
-                yield obj
+                yield {
+                    **obj,
+                    "_parsed_prompt_id": pid,
+                    "_parsed_is_system": False,
+                    "_parsed_source": "subagent",
+                    "_parsed_attribution_agent": agent_type,
+                    "_parsed_subagent_file": sf,
+                }

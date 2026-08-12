@@ -193,6 +193,11 @@ def scan_per_turn(jsonl_path: Path) -> list[dict]:
                 target_idx = pid_to_turn[pid]
                 break
         if target_idx is None and turns:
+            # No matching promptId — attribute to the last turn as best guess
+            import logging
+            logging.getLogger(__name__).debug(
+                "Subagent file %s has no matching turn promptId; attributing to last turn", sf.name,
+            )
             target_idx = len(turns) - 1
 
         if target_idx is not None:
@@ -315,11 +320,13 @@ def assess_triggers(turns: list[dict]) -> list[dict]:
         last_model = last_turn.get("max_prompt_model", "") or (last_turn["models"][0] if last_turn["models"] else "")
         ctx_lim = context_limit(last_model)
 
+        # Detect compaction: a 40%+ drop in prompt tokens between consecutive
+        # turns suggests context was summarized/compacted. Skip near-empty turns
+        # (<1K tokens) to avoid false positives from cache-priming requests.
         compaction_count = 0
         for i in range(1, n):
             prev_ctx = turns[i - 1]["max_prompt_tokens"]
             curr_ctx = turns[i]["max_prompt_tokens"]
-            # Skip cache-priming or near-empty turns (input_tokens ~ 0)
             if curr_ctx < 1000:
                 continue
             if prev_ctx > 0 and curr_ctx < prev_ctx * 0.6:

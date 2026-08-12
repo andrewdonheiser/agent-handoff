@@ -1,4 +1,4 @@
-"""Tests for scan_per_turn — per-model cost and subagent inclusion."""
+"""Tests for scan_per_turn and assess_triggers."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from price_check import main
-from scripts.analyze_session import scan_per_turn
+from scripts.analyze_session import assess_triggers, scan_per_turn
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -233,3 +233,128 @@ class TestSubagentInclusion:
         assert len(turns) == 1
         assert turns[0]["input"] == 1000  # 100 + 200 + 300 + 400
         assert turns[0]["output"] == 500
+
+
+# ── assess_triggers ─────────────────────────────────────────────────
+
+def _make_turn(
+    turn_number: int = 1,
+    input_tokens: int = 1000,
+    output_tokens: int = 500,
+    cache_read: int = 0,
+    cache_write: int = 0,
+    cost: float = 0.01,
+    models: list[str] | None = None,
+    max_prompt_tokens: int = 0,
+    max_prompt_model: str = "claude-opus-4-6",
+    tool_calls: list[dict] | None = None,
+    error_count: int = 0,
+    api_calls: int = 1,
+) -> dict:
+    if models is None:
+        models = ["claude-opus-4-6"]
+    return {
+        "turn_number": turn_number,
+        "prompt_id": f"p{turn_number}",
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total_tokens": input_tokens + output_tokens + cache_read + cache_write,
+        "cache_hit_pct": round(cache_read / max(input_tokens + cache_read, 1) * 100, 1),
+        "cost": cost,
+        "models": models,
+        "tool_calls": tool_calls or [],
+        "error_count": error_count,
+        "api_calls": api_calls,
+        "max_prompt_tokens": max_prompt_tokens,
+        "max_prompt_model": max_prompt_model,
+    }
+
+
+def _get_trigger(triggers: list[dict], name: str) -> dict:
+    return next(t for t in triggers if t["trigger"] == name)
+
+
+class TestContextUtilizationTrigger:
+    def test_no_turns(self):
+        triggers = assess_triggers([])
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is False
+        assert ctx["evidence"]["reason"] == "no turns"
+
+    def test_below_threshold_no_fire(self):
+        turns = [_make_turn(i + 1, max_prompt_tokens=100_000) for i in range(3)]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is False
+        assert ctx["severity"] == "none"
+
+    def test_above_80_pct_fires_medium(self):
+        turns = [_make_turn(i + 1, max_prompt_tokens=170_000) for i in range(3)]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is True
+        assert ctx["severity"] == "medium"
+
+    def test_above_90_pct_fires_high(self):
+        turns = [_make_turn(i + 1, max_prompt_tokens=185_000) for i in range(3)]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is True
+        assert ctx["severity"] == "high"
+
+    def test_compaction_count_triggers_medium(self):
+        turns = [
+            _make_turn(1, max_prompt_tokens=100_000),
+            _make_turn(2, max_prompt_tokens=50_000),   # 50% drop -> compaction
+            _make_turn(3, max_prompt_tokens=100_000),
+            _make_turn(4, max_prompt_tokens=50_000),   # another compaction
+        ]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is True
+        assert ctx["evidence"]["compaction_count"] == 2
+
+    def test_compaction_skips_near_empty_turns(self):
+        turns = [
+            _make_turn(1, max_prompt_tokens=100_000),
+            _make_turn(2, max_prompt_tokens=500),   # < 1000, skipped
+            _make_turn(3, max_prompt_tokens=100_000),
+        ]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["evidence"]["compaction_count"] == 0
+
+    def test_unknown_model_does_not_fire(self):
+        turns = [_make_turn(1, max_prompt_tokens=100_000, max_prompt_model="gpt-4o", models=["gpt-4o"])]
+        triggers = assess_triggers(turns)
+        ctx = _get_trigger(triggers, "context_utilization")
+        assert ctx["fired"] is False
+        assert "unknown context limit" in ctx["evidence"]["reason"]
+
+
+class TestCombinedContextPressure:
+    def _build_turns(self, n=12, cost_ratio=1.0, cache_pct=80.0, max_prompt=50_000):
+        turns = []
+        for i in range(n):
+            c = 0.01 * (1 + (cost_ratio - 1) * i / max(n - 1, 1))
+            cr = int(1000 * cache_pct / 100)
+            inp = 1000 - cr
+            turns.append(_make_turn(
+                i + 1, input_tokens=inp, cache_read=cr,
+                cost=c, max_prompt_tokens=max_prompt,
+            ))
+        return turns
+
+    def test_not_fired_when_no_sub_triggers(self):
+        turns = self._build_turns()
+        triggers = assess_triggers(turns)
+        combined = _get_trigger(triggers, "combined_context_pressure")
+        assert combined["fired"] is False
+
+    def test_fired_with_context_util_and_efficiency(self):
+        turns = self._build_turns(cost_ratio=5.0, max_prompt=185_000)
+        triggers = assess_triggers(turns)
+        combined = _get_trigger(triggers, "combined_context_pressure")
+        assert combined["fired"] is True

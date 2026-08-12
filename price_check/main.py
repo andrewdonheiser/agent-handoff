@@ -22,18 +22,18 @@ from collections import defaultdict
 from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
-# Ensure the package root is on sys.path when run as a standalone script
 _pkg_root = str(Path(__file__).resolve().parent.parent)
 if _pkg_root not in sys.path:
     sys.path.insert(0, _pkg_root)
 
-MAX_JSONL_SIZE = 100 * 1024 * 1024  # 100 MB
 from price_check.parsing import (  # noqa: E402
     _is_system_prompt,
     _SYSTEM_PREFIXES,
     discover_subagent_files,
     iter_session_records,
 )
+
+MAX_JSONL_SIZE = 100 * 1024 * 1024  # 100 MB
 _TAG_ABBREV = {"standard": "std", "medium": "med", "high": "hi", "fast": "fast"}
 PERIOD_CACHE_TTL = 60  # seconds - how long to cache period totals (today/week/month)
 
