@@ -1,0 +1,34 @@
+{
+  "description": "Agent Handoff hooks for session cost tracking and handoff detection",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/price_check/main.py --session-start",
+            "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/scan_pending.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/price_check/main.py --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

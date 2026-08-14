@@ -5,7 +5,8 @@ description: >-
   mismatch, and stuck patterns. Recommends when to hand off to a fresh agent
   and generates a structured handoff document with transition guidance.
   Invoke with /agent-handoff to check session health, or /agent-handoff now
-  to generate the handoff doc immediately.
+  to generate the handoff doc immediately. Use /agent-handoff --load to
+  load a pending handoff from a previous session.
 allowed-tools:
   - Bash
   - Read
@@ -22,15 +23,27 @@ You are an agent that analyzes session health and facilitates handoffs between C
 - `/agent-handoff` — Run diagnostics and present the assessment
 - `/agent-handoff now` — Skip diagnostics display, go straight to generating the handoff document (still confirms with user)
 - `/agent-handoff check` — Same as bare `/agent-handoff`
+- `/agent-handoff --load` — List pending handoffs and let the user pick one to load
+- `/agent-handoff --load-latest` — Load the most recent pending handoff for the current project
 
 ## Procedure
+
+### Routing
+
+Check the invocation arguments first:
+- If `--load` or `--load-latest`: go to **Step L1** (Load Handoff flow)
+- Otherwise: continue to **Step 1** (Health Check flow)
+
+---
+
+## Health Check Flow
 
 ### Step 1: Gather Session Metrics
 
 Run the analysis script to get session metrics and trigger assessments:
 
 ```bash
-echo '{"session_id": "'"$SESSION_ID"'", "cwd": "'"$(pwd)"'"}' | PYTHONPATH=/Users/adonheis/Projects/redhat/agent-handoff python3 /Users/adonheis/Projects/redhat/agent-handoff/scripts/analyze_session.py
+echo '{"session_id": "'"$SESSION_ID"'", "cwd": "'"$(pwd)"'"}' | PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/analyze_session.py
 ```
 
 The `$SESSION_ID` environment variable contains the current session ID. If it's not set, check if `$CLAUDE_SESSION_ID` is available. If neither is available, look for the most recently modified `.jsonl` file in `~/.claude/projects/`.
@@ -76,7 +89,7 @@ If the user declines, acknowledge and continue — do not take any further actio
 ### Step 4: Generate the Handoff Document
 
 Read the handoff guide for best practices:
-- `references/handoff-guide.md`
+- `${CLAUDE_PLUGIN_ROOT}/references/handoff-guide.md`
 
 Gather context for the handoff document:
 1. **Files modified**: Run `git diff --name-only HEAD~10..HEAD 2>/dev/null || git diff --name-only` and `git status --short` to find changed files
@@ -84,7 +97,32 @@ Gather context for the handoff document:
 3. **Recent work**: Review the conversation context — what was accomplished, what decisions were made
 4. **Remaining tasks**: What the user was working toward, what's left
 
-Write `HANDOFF.md` to the project's working directory using this format:
+**Check for drafts**: List any auto-draft snapshots that exist:
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py slug --cwd "$(pwd)"
+```
+
+Use the slug to check for drafts. If drafts exist, fold their content (session stats, progress notes) into the handoff document as additional context.
+
+**Get project slug** for saving:
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py slug --cwd "$(pwd)"
+```
+
+**Write to both locations:**
+
+1. Write `HANDOFF.md` to the project's working directory (backward compatibility)
+2. Save to the handoff archive by piping the same content:
+
+```bash
+echo '<handoff content>' | PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py save --slug "<project-slug>" --semantic "<short-description>"
+```
+
+The `--semantic` value should be a brief kebab-case slug describing the work (e.g., "auth-refactor", "test-flakiness", "api-migration").
+
+Use this format for the handoff content:
 
 ```markdown
 # Agent Handoff Document
@@ -128,7 +166,56 @@ Session: {session_id} | Turns: {N} | Cost: ${X} | Tokens: {Y}
 
 ### Step 5: Report to User
 
-After writing `HANDOFF.md`, tell the user:
-1. Where the file was written
+After writing the handoff, tell the user:
+1. Where the file was written (both the local `HANDOFF.md` and the archived copy)
 2. How to start the next session (the exact command or steps)
 3. Remind them to commit or stash any uncommitted work before closing this session
+
+---
+
+## Load Handoff Flow
+
+### Step L1: Get Project Slug
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py slug --cwd "$(pwd)"
+```
+
+### Step L2: List Pending Handoffs
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py list --slug "<project-slug>"
+```
+
+Parse the JSON output. If `pending` is empty, tell the user "No pending handoffs for this project" and stop.
+
+### Step L3: Select Handoff
+
+- If invoked with `--load-latest`: automatically select the last (most recent) file in the pending list.
+- If invoked with `--load`: present the list to the user via `AskUserQuestion` and let them pick which handoff to load. Show filenames (which include the date and semantic slug).
+
+### Step L4: Load and Present
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py load --slug "<project-slug>" --file "<filename>"
+```
+
+Read the handoff content. Present a summary to the user:
+- When the handoff was generated
+- What work was accomplished
+- What remains
+- The recommended model and approach
+
+Ask the user: "Would you like me to continue from this handoff? I'll archive it and pick up the remaining work."
+
+### Step L5: Archive and Continue
+
+If the user confirms:
+
+```bash
+PYTHONPATH=${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/handoff/cli.py archive --slug "<project-slug>" --file "<filename>"
+```
+
+Then begin working on the tasks described in "What Remains", using the context from the handoff document.
+
+If the user declines, acknowledge and stop.

@@ -1,0 +1,11 @@
+{
+  "name": "agent-handoff",
+  "version": "2.0.0",
+  "description": "Session health monitoring, cost tracking, and structured handoffs for Claude Code",
+  "author": {
+    "name": "Andrew Donheiser"
+  },
+  "keywords": ["claude-code", "session-handoff", "cost-tracking", "token-usage"],
+  "skills": "./skills",
+  "hooks": "./hooks.json"
+}

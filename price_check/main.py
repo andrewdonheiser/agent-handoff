@@ -1315,6 +1315,32 @@ def run_hook():
 
     _write_state(state_file, json.dumps(state))
 
+    # Auto-draft: if enabled, save a lightweight session snapshot
+    _try_auto_draft(session_id, hook_input.get("cwd", ""), state)
+
+
+def _try_auto_draft(session_id: str, cwd: str, state: dict) -> None:
+    """Create an auto-draft snapshot if configured. Never raises."""
+    try:
+        from handoff.storage import get_project_slug, load_config
+        from handoff.drafts import should_create_draft, save_draft
+
+        config = load_config()
+        if not config.get("auto_handoff", False):
+            return
+
+        slug = get_project_slug(cwd) if cwd else "unknown"
+        if not should_create_draft(slug, session_id):
+            return
+
+        cost = sum(m.get("cost") or 0 for m in state.get("by_model", {}).values())
+        tokens = sum(m.get("tokens") or 0 for m in state.get("by_model", {}).values())
+        turns = state.get("turns", {}).get("session", 0)
+        summary = f"Session snapshot: {turns} turns, ${cost:.2f}, {tokens:,} tokens"
+        save_draft(slug, session_id, summary)
+    except Exception:
+        pass
+
 
 def _compute_state(session_id: str, cwd: str = "") -> dict | None:
     """Scan session JSONL and return state dict (same shape as run_hook writes)."""
